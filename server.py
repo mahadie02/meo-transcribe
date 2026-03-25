@@ -11,6 +11,7 @@ import os
 import io
 import gc
 import re
+import shutil
 import subprocess
 import base64
 import tempfile
@@ -194,6 +195,62 @@ def _ytdlp_cookie_options() -> dict:
     return opts
 
 
+def _ytdlp_js_runtime_options() -> dict:
+    """
+    yt-dlp defaults to enabling 'deno' even when not installed, which yields no working JS runtime
+    on minimal Linux servers and forces a weak YouTube client set (often → 'Requested format is not available').
+
+    - YTDLP_JS_RUNTIMES=auto (default): enable every runtime found on PATH among deno, node, bun, quickjs.
+    - YTDLP_JS_RUNTIMES=none: disable all (rely on multi-client YouTube extraction only).
+    - YTDLP_JS_RUNTIMES=node or deno:bun: optional explicit path after colon, e.g. node:/usr/bin/node
+    See https://github.com/yt-dlp/yt-dlp/wiki/EJS
+    """
+    spec_raw = (os.getenv("YTDLP_JS_RUNTIMES") or "auto").strip()
+    lower = spec_raw.lower()
+    if lower in ("none", "off", "false", "0"):
+        return {"js_runtimes": {}}
+    if lower != "auto":
+        if ":" in spec_raw:
+            name, _, path = spec_raw.partition(":")
+            name, path = name.strip().lower(), path.strip()
+            if name in ("deno", "node", "bun", "quickjs") and path:
+                return {"js_runtimes": {name: {"path": path}}}
+        elif lower in ("deno", "node", "bun", "quickjs"):
+            return {"js_runtimes": {lower: {}}}
+        return {"js_runtimes": {}}
+    runtimes = {}
+    for name in ("deno", "node", "bun", "quickjs"):
+        if shutil.which(name):
+            runtimes[name] = {}
+    return {"js_runtimes": runtimes}
+
+
+def _ytdlp_youtube_extractor_args() -> dict:
+    """
+    Without a JS runtime, yt-dlp only uses android_vr by default — often too few formats for our selector.
+    Request several InnerTube clients so DASH/HLS formats exist on headless ARM64/Linux VPSes.
+
+    Override with YTDLP_YOUTUBE_PLAYER_CLIENTS=comma-separated list (e.g. android,ios,tv,mweb).
+    """
+    raw = (os.getenv("YTDLP_YOUTUBE_PLAYER_CLIENTS") or "").strip()
+    if raw:
+        clients = [c.strip() for c in raw.split(",") if c.strip()]
+        if clients:
+            return {"youtube": {"player_client": clients}}
+    return {
+        "youtube": {
+            "player_client": [
+                "android",
+                "ios",
+                "android_vr",
+                "tv",
+                "mweb",
+                "web_safari",
+            ],
+        },
+    }
+
+
 def download_stream_audio_with_ytdlp(url: str) -> str:
     """
     Download best audio from a URL supported by yt-dlp (YouTube watch + /shorts/, Facebook, Instagram,
@@ -206,15 +263,19 @@ def download_stream_audio_with_ytdlp(url: str) -> str:
         out_tmpl = base + ".%(ext)s"
         # YouTube often has no single "bestaudio" in the list (DASH-only); merge bv+ba then extract audio.
         # Shorts (youtube.com/shorts/ID) use the same extractor as watch URLs.
+        ytdlp_verbose = (os.getenv("YTDLP_VERBOSE") or "").lower() in ("1", "true", "yes")
         ydl_opts = {
-            "format": "bestaudio/bv+ba/best/worst",
+            "format": "bestaudio/bv+ba/ba+bv/best/worst",
             "merge_output_format": "mp4",
             "outtmpl": out_tmpl,
             "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "m4a"}],
-            "quiet": True,
+            "quiet": not ytdlp_verbose,
+            "no_warnings": not ytdlp_verbose,
             "no_color": True,
             "noplaylist": True,
+            "extractor_args": _ytdlp_youtube_extractor_args(),
         }
+        ydl_opts.update(_ytdlp_js_runtime_options())
         ydl_opts.update(_ytdlp_cookie_options())
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
