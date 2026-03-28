@@ -1,4 +1,4 @@
-# WhisperX API Server
+# Rex-Transcribe
 
 A FastAPI-based Speech-to-Text transcription server using [WhisperX](https://github.com/m-bain/whisperX). Accepts audio via file upload, base64, or URL, and returns transcripts in JSON (n8n-friendly) or other formats.
 
@@ -8,6 +8,7 @@ A FastAPI-based Speech-to-Text transcription server using [WhisperX](https://git
 - **Flexible Output**: JSON (default, n8n-friendly), TXT, SRT, VTT, TSV
 - **Output Detail**: Segments only, words only, or both (for JSON)
 - **Segment Splitting**: Splits at natural breaks (comma, semicolon, period, etc.) into separate segments with timestamps; `max_line_width` for long phrases
+- **Smart Splitting**: Optional balanced line breaks (`smart_split`) and punctuation control (`split_on_punctuation`) for cleaner subtitles
 - **Full WhisperX Parameters**: Model, batch size, language, alignment, diarization, ASR options, VAD options
 - **Similar API Style**: Matches pocket-tts-server (.env, API_KEY, structure)
 - **GPU/CPU Support**: Auto-detects CUDA; configurable device and compute type
@@ -164,6 +165,30 @@ Stream URLs (`youtube_url`, `fb_url`, `insta_url`, `tiktok_url`, `x_url`, `threa
 | `output_detail` | string | segments | For JSON: **segments**, words (adds words array), or both |
 | `max_line_width` | int | null | Max characters per segment; splits long phrases at word boundaries |
 | `max_line_count` | int | null | Max segments per original block (srt/vtt) |
+| `split_on_punctuation` | bool | true | Split at punctuation marks (comma, period, semicolon, etc.) before applying `max_line_width`. Set `false` to treat text as one block and split only by width |
+| `smart_split` | bool | false | Produce balanced line breaks instead of greedy packing. See [Smart Split](#smart-split) below |
+
+#### Smart Split
+
+When `smart_split=false` (default), words are packed greedily until hitting `max_line_width`, which often produces an ugly short leftover:
+
+```
+Explanation by the tongue makes most    ← packed to the limit
+things clear.                           ← tiny leftover
+```
+
+When `smart_split=true`, lines are balanced so both halves look natural:
+
+```
+Explanation by the tongue               ← balanced
+makes most things clear.                ← balanced
+```
+
+#### Punctuation Splitting
+
+When `split_on_punctuation=true` (default), text is first split at natural break points (`, ; . ! ? :`) before `max_line_width` is applied. Short clauses become their own segments.
+
+When `split_on_punctuation=false`, text is treated as one continuous block and split **only** by `max_line_width`. This prevents short phrases (e.g. `"love is the astrolabe of God's mysteries."`) from becoming standalone segments when your width is large (55–60+).
 
 ---
 
@@ -334,6 +359,19 @@ curl -X POST http://localhost:5505/transcript \
   -F "output_format=json"
 ```
 
+### cURL – SRT with Smart Splitting
+
+```bash
+# Balanced line breaks, no punctuation splitting, max 50 chars
+curl -X POST http://localhost:5505/transcript \
+  -H "API_KEY: your_api_key" \
+  -F "audio=@recording.mp3" \
+  -F "output_format=srt" \
+  -F "max_line_width=50" \
+  -F "smart_split=true" \
+  -F "split_on_punctuation=false"
+```
+
 ### cURL – SRT with Line Limits
 
 ```bash
@@ -376,6 +414,16 @@ r = requests.post(url, headers=headers, data={
     "output_format": "json",
 })
 print(r.json())
+
+# Smart split + no punctuation splitting
+r = requests.post(url, headers=headers, data={
+    "youtube_url": "https://www.youtube.com/watch?v=VIDEO_ID",
+    "output_format": "srt",
+    "max_line_width": "50",
+    "smart_split": "true",
+    "split_on_punctuation": "false",
+})
+print(r.text)
 ```
 
 ### n8n Integration
@@ -387,7 +435,7 @@ Use the **HTTP Request** node:
 - **Authentication:** Header `API_KEY` = your key
 - **Body Content Type:** Form-Data
 - **Body Parameters:**
-  - `audio` (File) – from previous node’s binary data, or
+  - `audio` (File) – from previous node's binary data, or
   - `audio_url` (String) – URL to audio
   - `output_format`: `json`
   - `output_detail`: `both` (optional)
@@ -399,7 +447,7 @@ The response is JSON data, suitable for use in subsequent n8n nodes.
 ## Directory Structure
 
 ```
-whisperx-server/
+rex-transcribe/
 ├── server.py           # Main server
 ├── requirements.txt    # Dependencies
 ├── .env                # Configuration (create from .env.example)
@@ -424,10 +472,40 @@ whisperx-server/
 - Use smaller model (`base` or `small`)
 - Use `compute_type=int8`
 
-### Diarization Fails
+### YouTube / yt-dlp Downloads Failing
 
-- Set `HF_TOKEN` in `.env`
-- Accept terms at [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1)
+**YouTube blocks datacenter/VPS IPs** (Oracle Cloud, AWS, GCP, etc.) and requires authentication via browser cookies. This is the most common issue on headless servers.
+
+**Step 1: Export cookies from your browser (on your local machine)**
+1. Install a cookie export extension in Chrome/Edge/Firefox:
+   - Chrome/Edge: [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc)
+   - Firefox: [cookies.txt](https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/)
+2. Go to [youtube.com](https://youtube.com) and make sure you're **logged in**
+3. Click the extension icon → **Export** → save as `cookies.txt`
+
+**Step 2: Upload to your VPS**
+```bash
+scp cookies.txt user@your-vps:/path/to/rex-transcribe/cookies.txt
+```
+
+**Step 3: Configure `.env`**
+```ini
+YTDLP_COOKIES_FILE=cookies.txt
+```
+
+**Step 4: Restart the server**
+
+> **Note:** Cookies expire periodically. If YouTube stops working again, re-export fresh cookies.
+
+**JS Runtime (also required for YouTube)**
+
+yt-dlp only enables Deno by default. If you have Node.js installed, set it explicitly:
+```ini
+YTDLP_JS_RUNTIMES=node:/usr/bin/node
+```
+Find your node path with `which node`.
+
+**Do not** manually set `YTDLP_YOUTUBE_PLAYER_CLIENTS` unless you know what you're doing.
 
 ### FFmpeg Not Found
 

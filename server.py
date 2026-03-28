@@ -709,23 +709,100 @@ def transcribe_audio(audio_path: str, params: dict) -> dict:
     return result
 
 
+def _smart_split_words(words: list[str], max_width: int) -> list[str]:
+    """
+    Split a list of words into lines of at most max_width characters.
+    Instead of greedily packing words until hitting the limit
+    (which produces an ugly short leftover), this finds a more
+    balanced break — roughly equal-length halves — so lines look
+    natural for subtitles.
+
+    Example with max_width=40:
+      Greedy:  "Explanation by the tongue makes most" + "things clear."
+      Smart:   "Explanation by the tongue" + "makes most things clear."
+    """
+    if not words:
+        return []
+
+    full = " ".join(words)
+    if len(full) <= max_width:
+        return [full]
+
+    # How many lines do we need at minimum?
+    n_lines = max(2, -(-len(full) // max_width))  # ceil division
+    target_per_line = len(full) / n_lines
+
+    lines: list[str] = []
+    remaining = list(words)
+
+    while remaining:
+        # If what's left fits, emit it and stop
+        rest = " ".join(remaining)
+        if len(rest) <= max_width:
+            lines.append(rest)
+            break
+
+        # Try to find the break closest to target_per_line
+        best_idx = 0
+        best_diff = float("inf")
+        running = 0
+        for i, w in enumerate(remaining):
+            running += len(w) + (1 if i > 0 else 0)
+            if running > max_width:
+                break
+            diff = abs(running - target_per_line)
+            if diff < best_diff:
+                best_diff = diff
+                best_idx = i
+
+        # Take at least one word
+        split_at = best_idx + 1
+        lines.append(" ".join(remaining[:split_at]))
+        remaining = remaining[split_at:]
+
+    return lines
+
+
 def _split_text_into_phrases(
     text: str,
     max_line_width: Optional[int] = None,
     max_line_count: Optional[int] = None,
+    split_on_punctuation: bool = True,
+    smart_split: bool = False,
 ) -> list[str]:
     """
-    Split text into phrases at natural break points (comma, semicolon, period, etc.).
-    If max_line_width is set, further split long phrases at word boundaries.
+    Split text into phrases for subtitle display.
+
+    Parameters:
+      split_on_punctuation: If True (default), first split at punctuation marks
+        (comma, semicolon, period, etc.) and then honour max_line_width.
+        If False, treat the text as one block and split only by max_line_width.
+      smart_split: If True, produce more balanced line breaks instead
+        of greedily packing words until hitting max_line_width.
+        e.g. "Explanation by the tongue | makes most things clear."
+        instead of "Explanation by the tongue makes most | things clear."
     """
     text = (text or "").strip()
     if not text:
         return []
 
-    # Split after comma, semicolon, period, exclamation, question mark, colon
-    parts = re.split(r"(?<=[,;.!?:])\s+", text)
-    parts = [p.strip() for p in parts if p.strip()]
+    # --- Step 1: initial parts ---
+    if split_on_punctuation:
+        # Split after comma, semicolon, period, exclamation, question mark, colon
+        parts = re.split(r"(?<=[,;.!?:])\s+", text)
+        parts = [p.strip() for p in parts if p.strip()]
+    else:
+        # Treat entire text as a single block
+        parts = [text]
 
+    # --- No width limit ---
+    if max_line_width is None:
+        phrases = parts if split_on_punctuation else [text]
+        if max_line_count is not None and max_line_count > 0 and len(phrases) > max_line_count:
+            phrases = phrases[:max_line_count]
+        return phrases
+
+    # --- Step 2: split/merge parts to fit max_line_width ---
     phrases: list[str] = []
     current: list[str] = []
 
@@ -737,34 +814,47 @@ def _split_text_into_phrases(
 
     for part in parts:
         part_len = len(part)
-        # No limits: each natural part is its own phrase
-        if max_line_width is None and max_line_count is None:
-            phrases.append(part)
-            continue
-        if max_line_width is not None and part_len > max_line_width:
+
+        if part_len > max_line_width:
             flush()
+            # This part alone exceeds the limit — split at word boundaries
             words = part.split()
-            line_words: list[str] = []
-            line_len = 0
-            for w in words:
-                need = line_len + (len(line_words) > 0) + len(w)
-                if line_words and need > max_line_width:
+            if smart_split:
+                phrases.extend(_smart_split_words(words, max_line_width))
+            else:
+                # Greedy: pack words until hitting the limit
+                line_words: list[str] = []
+                line_len = 0
+                for w in words:
+                    need = line_len + (1 if line_words else 0) + len(w)
+                    if line_words and need > max_line_width:
+                        phrases.append(" ".join(line_words))
+                        line_words = []
+                        line_len = 0
+                    line_words.append(w)
+                    line_len += len(w) + (1 if line_len else 0)
+                if line_words:
                     phrases.append(" ".join(line_words))
-                    line_words = []
-                    line_len = 0
-                line_words.append(w)
-                line_len += len(w) + (1 if line_len else 0)
-            if line_words:
-                phrases.append(" ".join(line_words))
             continue
-        if max_line_width is not None and current:
+
+        if current:
             combined = " ".join(current) + " " + part
             if len(combined) > max_line_width:
                 flush()
         current.append(part)
 
-    if current:
-        phrases.append(" ".join(current))
+    flush()
+
+    # --- Step 3: smart rebalance pass ---
+    # If smart mode is on, rebalance any phrases that can be split more evenly
+    if smart_split:
+        rebalanced: list[str] = []
+        for phrase in phrases:
+            if len(phrase) > max_line_width:
+                rebalanced.extend(_smart_split_words(phrase.split(), max_line_width))
+            else:
+                rebalanced.append(phrase)
+        phrases = rebalanced
 
     if max_line_count is not None and max_line_count > 0 and len(phrases) > max_line_count:
         phrases = phrases[:max_line_count]
@@ -776,6 +866,8 @@ def _split_segment_into_subsegments(
     seg: dict,
     max_line_width: Optional[int] = None,
     max_line_count: Optional[int] = None,
+    split_on_punctuation: bool = True,
+    smart_split: bool = False,
 ) -> list[dict]:
     """
     Split a segment by natural breaks (comma, semicolon, etc.) into sub-segments,
@@ -785,7 +877,11 @@ def _split_segment_into_subsegments(
     if not txt:
         return [seg] if seg.get("start") is not None else []
 
-    phrases = _split_text_into_phrases(txt, max_line_width, max_line_count)
+    phrases = _split_text_into_phrases(
+        txt, max_line_width, max_line_count,
+        split_on_punctuation=split_on_punctuation,
+        smart_split=smart_split,
+    )
     if len(phrases) <= 1:
         return [seg]
 
@@ -842,6 +938,8 @@ def format_result(
     output_detail: str,
     max_line_width: Optional[int],
     max_line_count: Optional[int],
+    split_on_punctuation: bool = True,
+    smart_split: bool = False,
 ) -> str | dict:
     """Format transcription result. Splits segments at natural breaks (comma, semicolon, etc.) into separate segments with timestamps."""
 
@@ -849,7 +947,11 @@ def format_result(
         """Split each segment by natural breaks; each phrase becomes its own segment with start/end."""
         out: list[dict] = []
         for s in segs:
-            subsegs = _split_segment_into_subsegments(s, max_line_width, max_line_count)
+            subsegs = _split_segment_into_subsegments(
+                s, max_line_width, max_line_count,
+                split_on_punctuation=split_on_punctuation,
+                smart_split=smart_split,
+            )
             out.extend(subsegs)
         return out
 
@@ -949,6 +1051,8 @@ async def transcript(
     output_detail: str = Form("segments", description="For JSON: segments (default), words (adds words array), or both"),
     max_line_width: Optional[int] = Form(None, description="Max characters per segment; splits long phrases at word boundaries"),
     max_line_count: Optional[int] = Form(None, description="Max segments per original block (srt/vtt)"),
+    split_on_punctuation: bool = Form(True, description="Split at punctuation marks (comma, period, etc.) before applying max_line_width. Set False to split only by width."),
+    smart_split: bool = Form(False, description="Produce balanced line breaks instead of greedy packing. E.g. 'Explanation by the tongue / makes most things clear' instead of 'Explanation by the tongue makes most / things clear'"),
     # Model
     model: str = Form("base", description="Whisper model: tiny, base, small, medium, large-v2, large-v3"),
     batch_size: int = Form(16, description="Batch size for inference"),
@@ -1042,7 +1146,11 @@ async def transcript(
         if detail not in ("segments", "words", "both"):
             detail = "segments"
 
-        formatted = format_result(result, fmt, detail, max_line_width, max_line_count)
+        formatted = format_result(
+            result, fmt, detail, max_line_width, max_line_count,
+            split_on_punctuation=split_on_punctuation,
+            smart_split=smart_split,
+        )
 
         if isinstance(formatted, dict):
             return JSONResponse(formatted)
